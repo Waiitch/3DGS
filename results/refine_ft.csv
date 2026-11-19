@@ -1,0 +1,3 @@
+tag,gaussians,iterations,seconds,sec_per_1k,psnr,ssim,lpips
+rft_truck_k10,205572,5000,83,16.60,,,
+rft_truck_k50,1027857,5000,153,30.60,,,

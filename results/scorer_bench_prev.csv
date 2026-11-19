@@ -1,0 +1,13 @@
+scene,cfg,rho,rep,rc,wall_s,e2e_s,cost_s,final
+truck,maha_fast_o0,0.1,1,0,10.782,8.041,0.246,205572
+truck,maha_fast_o0,0.1,2,0,10.292,7.733,0.223,205572
+truck,maha_fast_o0,0.1,3,0,10.331,7.681,0.293,205572
+truck,maha_fast_o2cal,0.1,1,0,11.213,8.687,0.226,205572
+truck,maha_fast_o2cal,0.1,2,0,11.878,8.603,0.237,205572
+truck,maha_fast_o2cal,0.1,3,0,11.078,8.467,0.23,205572
+room,maha_fast_o0,0.1,1,0,8.283,5.727,0.172,131226
+room,maha_fast_o0,0.1,2,0,8.208,5.714,0.179,131226
+room,maha_fast_o0,0.1,3,0,8.212,5.675,0.186,131226
+room,maha_fast_o2cal,0.1,1,0,8.841,6.117,0.168,131226
+room,maha_fast_o2cal,0.1,2,0,8.681,6.094,0.173,131226
+room,maha_fast_o2cal,0.1,3,0,8.759,6.172,0.192,131226
