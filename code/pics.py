@@ -22,6 +22,8 @@ in-pipeline kernel share one implementation of the math (identical to
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import torch
 
@@ -156,7 +158,7 @@ class CamPool:
 
     @torch.no_grad()
     def select(self, scr, strategy="sup", B=8, qmin=0.05, fast_ids=None,
-               nbins=None, pref_ids=None, track_lam=None):
+               nbins=None, pref_ids=None, track_lam=None, rstar=5.0):
         """Return (P,B) int32 camera ids; padding is -1.
 
         strategy:
@@ -193,6 +195,25 @@ class CamPool:
             keep = vals > -1e7
             ids = ids.to(torch.int32)
             idx = torch.where(keep, ids, torch.full_like(ids, -1))
+        elif strategy == "scale_opt":
+            # T3-B: per-pair projected-scale matching.  Pick the views whose
+            # footprint area (log1p px^2, monotone in the projected radius) is
+            # closest to the ideal r*, greedily masking the already-chosen views.
+            if scr["area"] is None:
+                raise ValueError("strategy 'scale_opt' needs screen(want_area=True)")
+            tgt = float(np.log1p(math.pi * float(rstar) ** 2))
+            qual = -((scr["area"].to(torch.float32) - tgt) ** 2)
+            qual = torch.where(q >= qmin, qual, torch.full_like(qual, -1e8))
+            ids = torch.full((P, B), -1, dtype=torch.int32, device=self.dev)
+            for b in range(B):
+                vals, pick = torch.topk(qual, 1, dim=1)
+                keep = vals[:, 0] > -1e7
+                pk = torch.where(keep, pick[:, 0], torch.zeros_like(pick[:, 0]))
+                ids[:, b] = torch.where(keep, pk.to(torch.int32),
+                                        torch.full_like(pk, -1, dtype=torch.int32))
+                qual.scatter_(1, pk[:, None], -1e8)
+            del qual
+            idx = ids
         elif strategy in ("strat", "repair", "fill"):
             if strategy == "repair" and fast_ids is None:
                 raise ValueError("strategy 'repair' needs fast_ids")

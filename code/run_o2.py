@@ -262,19 +262,89 @@ def main():
     ap.add_argument("--o2-grid", type=int, default=9)
     ap.add_argument("--o2-sigma-cut", type=float, default=2.0)
     ap.add_argument("--o2-batch", type=int, default=32768)
-    ap.add_argument("--o2-cams", choices=["fast", "ref", "virtual", "auto", "cover", "pair"],
+    ap.add_argument("--o2-cams", choices=["fast", "ref", "virtual", "auto", "cover", "pair",
+                                          "auto_virt", "json"],
                     default="auto",
                     help="fast: struct parser (bit-identical); ref: 3DGS colmap_loader; "
                          "virtual: rig synthesised from the point cloud only; "
+                         "auto_virt: camera-free 5-step voxel/set-cover rig "
+                         "(o2_auto_virt.py, no COLMAP at all); "
+                         "json: load an explicit camera list from --o2-cams-json; "
                          "pair: pair-conditioned selection from the whole fit pool (PICS)")
-    ap.add_argument("--o2-pick", choices=["sup", "info", "strat", "repair", "fill", "pref", "guard", "track", "fixed", "all", "dir"],
+    ap.add_argument("--o2-cams-json", default="",
+                    help="path of a camera list (JSON) for --o2-cams json")
+    ap.add_argument("--o2-dump-cams", default="",
+                    help="write the resolved camera list to this JSON path (round-trip "
+                         "verification for any --o2-cams mode)")
+    ap.add_argument("--o2-pool", choices=["real", "virt"], default="real",
+                    help="candidate pool for --o2-cams pair: the real COLMAP fit "
+                         "cameras (default) or the dense virtual rig produced by "
+                         "o2_auto_virt (camera-free PICS; per-pair view choice)")
+    ap.add_argument("--o2-rstar", type=float, default=5.0,
+                    help="T3-B: ideal projected pixel radius for --o2-pick scale_opt")
+    ap.add_argument("--o2-view-tau", type=float, default=0.0,
+                    help="S4: per-view projection-conditioning weight r^2/(r^2+tau^2) "
+                         "inside the O2cal least squares (0 = off; 0.5/1.0 px "
+                         "correspond to the sqrt(0.3)=0.55 px EWA floor)")
+    ap.add_argument("--o2-view-rmax", type=float, default=40.0,
+                    help="S4: hard cap (px) above which a view's weight is zero")
+    ap.add_argument("--o2-solver", choices=["grid", "analytic", "eigen"], default="grid",
+                    help="O2cal solver: the 9x9 local grid (default), the exact "
+                         "continuous L2 closed form, or the per-pair eigen-axis "
+                         "closed form (zero camera, zero grid)")
+    ap.add_argument("--o2-eigen-mode", choices=["E0", "E1", "E2", "E3", "E4"],
+                    default="E1",
+                    help="eigen solver variant: E0 = 8 fixed cube dirs, E1 = normal "
+                         "(scale-free), E2 = normal + gamma, E3 = 3 principal "
+                         "sections, E4 = normal + 35deg tilt cone")
+    ap.add_argument("--o2-eigen-gamma", type=float, default=0.0,
+                    help="eigen solver: pixel scale gamma = f_px/d_eff. 0 = auto "
+                         "(f_px/(c_dist*d_core))")
+    ap.add_argument("--o2-eigen-cdist", type=float, default=0.75,
+                    help="eigen solver: d_eff as a fraction of the core AABB extent")
+    ap.add_argument("--o2-eigen-eps", type=float, default=-1.0,
+                    help="eigen solver: EWA constant (0 or 0.3). <0 = auto per mode")
+    ap.add_argument("--o2-eigen-wmode", choices=["area", "eq", "det"], default="area",
+                    help="eigen solver: cross-view weight")
+    ap.add_argument("--o2-eigen-psi", type=float, default=35.0,
+                    help="eigen solver E4: tilt angle in degrees")
+    ap.add_argument("--o2-eigen-fpx", type=float, default=886.8,
+                    help="eigen solver: focal length in pixels (default 512/tan30deg "
+                         "for a 1024-wide 60deg view)")
+    ap.add_argument("--o2-debug-dump", default="",
+                    help="D1: dump per-(pair,view) O2cal intermediates of the first "
+                         "batch to this .pt path (diagnostics only)")
+    ap.add_argument("--o2-cf-fix", action="store_true",
+                    help="BROKEN, do not use (clamp+mask combination blows alpha up "
+                         "to 1e5). The core NaN guard alone is the working fix.")
+    ap.add_argument("--o2-cf-safe", action="store_true",
+                    help="BROKEN, do not use (see --o2-cf-fix)")
+    ap.add_argument("--o2-cf-c0", type=float, default=0.15,
+                    help="analytic ecc_floor: positive floor c0 (Fix 3)")
+    ap.add_argument("--o2-clean-mask", action="store_true",
+                    help="M2/M3: replace the sigma_cut footprint mask with a pure "
+                         "near-plane + centre-in-frame + non-degenerate test")
+    ap.add_argument("--o2-cf-bound", action="store_true",
+                    help="M2/M3: drop views whose cross ratios leave the rigorous "
+                         "bound [0, (2+beta)/(1+beta)]")
+    ap.add_argument("--o2-fit-dc", action="store_true",
+                    help="also refit the DC (RGB) SH coefficients in closed form, "
+                         "with the transmittance-weighted least-squares solution")
+    ap.add_argument("--o2-cf-beta", type=float, default=0.0,
+                    help="analytic solver: core-focus exponent beta (0 = unweighted)")
+    ap.add_argument("--o2-cf-agg", choices=["eq", "area", "ecc", "ecc_floor"],
+                    default="eq",
+                    help="analytic solver: per-view aggregation (eq = plain mean, "
+                         "area = pixel area, ecc = 1/kappa, the grid's implicit weight)")
+    ap.add_argument("--o2-pick", choices=["sup", "info", "strat", "repair", "fill", "pref", "guard", "track", "fixed", "all", "dir", "scale_opt"],
                     default="repair",
                     help="--o2-cams pair selection rule: sup=best support, "
                          "info=largest in-image footprint, strat=one per trajectory bin, "
                          "repair=strat but keep the fast view when it has support, "
                          "fill=stratified fill until the budget is used, "
                          "pref=keep the global cover set and repair its empty slots, guard=fast whenever it has any support (repair only the fallbacks), "
-                         "track=support gate + COLMAP track redundancy penalty")
+                         "track=support gate + COLMAP track redundancy penalty, "
+                         "scale_opt=per-pair projected-radius matching to --o2-rstar")
     ap.add_argument("--o2-qmin", type=float, default=0.05,
                     help="minimum in-image footprint fraction for a view to count as support")
     ap.add_argument("--o2-nbins", type=int, default=0,
@@ -295,10 +365,130 @@ def main():
     ap.add_argument("--o2-fov", type=float, default=55.0)
     ap.add_argument("--o2-res-w", type=int, default=1024)
     ap.add_argument("--o2-res-h", type=int, default=768)
+    # ---- camera-free auto_virt rig (camera_free_o2cal.md) ----------------
+    ap.add_argument("--av-res", type=int, default=64, help="coarse voxel grid R")
+    ap.add_argument("--av-npos", type=int, default=48, help="candidate positions (FPS)")
+    ap.add_argument("--av-ndirs", type=int, default=6,
+                    help="per-position headings: 6 axis / 8 cube corners for the "
+                         "axis mode; any >=3 for the gravity ring (density sweep)")
+    ap.add_argument("--av-fov", type=float, default=60.0, help="virtual FOV_x in degrees")
+    ap.add_argument("--av-cov-k", type=int, default=3, help="k of the k-coverage phi cap")
+    ap.add_argument("--av-dsafe", type=int, default=2, help="free-voxel clearance (voxels)")
+    ap.add_argument("--av-dfar", type=int, default=10, help="outer shell band (voxels)")
+    ap.add_argument("--av-rtarget", type=float, default=4.0,
+                    help="target projected radius of the median gaussian (px)")
+    ap.add_argument("--av-dlo", type=float, default=0.20,
+                    help="lower clip of d_target as a fraction of L_max "
+                         "(spec 0.08 pins every scene to the floor; 0.20 matches "
+                         "the real camera distance on truck/garden/bicycle/room)")
+    ap.add_argument("--av-dhi", type=float, default=0.65,
+                    help="upper clip of d_target as a fraction of L_max")
+    ap.add_argument("--av-cav6", type=int, default=20,
+                    help="min fully-enclosed voxels (6/6 rays) to call it indoor")
+    # ---- v2 stage-1 modules (see camera_free_o2cal_autovirt_v2.md) -------
+    ap.add_argument("--av-core-aabb", type=float, default=0.0,
+                    help="M1: keep the p_keep smallest in-plane-scale points for "
+                         "the core AABB (0.80 / 0.70); 0 = v1 behaviour")
+    ap.add_argument("--av-dmode", choices=["sgeom", "smid"], default="sgeom",
+                    help="M2a: d_target from the geometric-mean scale (v1) or from "
+                         "the in-plane median scale")
+    ap.add_argument("--av-rref", type=float, default=None,
+                    help="M2a: target projected radius in px (default 4.0 for "
+                         "sgeom, 1.5 for smid)")
+    ap.add_argument("--av-soft-scale", type=float, default=0.0,
+                    help="M2b: sigma_r of the continuous log-Gaussian scale "
+                         "kernel; >0 replaces the hard scale gate")
+    ap.add_argument("--av-dir-mode", choices=["axis", "gravity", "vote"],
+                    default="axis",
+                    help="M3/M5b: candidate headings from the 6 world axes (v1), a "
+                         "zero-roll yaw ring around the extracted gravity axis, or "
+                         "the voted view direction (+-35 deg) of M5")
+    ap.add_argument("--av-pitches", default="0",
+                    help="M3: comma separated pitch degrees, e.g. \"0,-15\"")
+    ap.add_argument("--av-grav-lower", type=float, default=0.0,
+                    help="B2: re-vote the gravity axis on this lower fraction of "
+                         "the flat gaussians (e.g. 0.35) to lock the floor")
+    ap.add_argument("--av-cos-weight", type=float, default=0.0,
+                    help="M4: gamma of the front-facing cosine coverage; >0 switches "
+                         "the greedy objective to saturating continuous coverage")
+    ap.add_argument("--av-cmax", type=float, default=2.0,
+                    help="M4: coverage saturation cap C_max")
+    ap.add_argument("--av-pos-mode", choices=["frontier", "vote", "pca_traj", "multishell",
+                                              "rings", "mixed", "dual_domain", "unified"],
+                    default="frontier",
+                    help="M5/M6: candidate positions from the v1 frontier, from "
+                         "surface-normal back-projection voting, or from a PCA "
+                         "compact/corridor trajectory")
+    ap.add_argument("--av-eta0", type=float, default=1.6,
+                    help="M6: compact vs corridor threshold on sqrt(l1/l2)")
+    ap.add_argument("--av-ncorr", type=int, default=16,
+                    help="M6: number of corridor cross-sections")
+    ap.add_argument("--av-dir-bins", type=int, default=0,
+                    help="M7a: >0 enables the azimuth quadrant coverage objective")
+    ap.add_argument("--av-aniso-weight", type=float, default=0.0,
+                    help="M7b: beta of the anisotropy sensitivity voxel weight")
+    ap.add_argument("--av-pca-corridor-only", action="store_true",
+                    help="M6c: only use the PCA corridor branch; compact (eta<eta0) "
+                         "scenes keep the v1 frontier positions")
+    ap.add_argument("--av-weight-mode", choices=["log", "n", "mip"], default="log",
+                    help="D3 density-weight probe: log1p(W_occ) (v1), N_v^0.5, or "
+                         "rho_mip^0.35")
+    ap.add_argument("--av-gate-rel", type=float, default=0.0,
+                    help="audit fix: centre the visibility gate window on the actual "
+                         "camera-to-scene distance instead of d_target (1.0 = on)")
+    ap.add_argument("--av-cover-target", choices=["voxel", "gauss"], default="voxel",
+                    help="greedy coverage objective: surface voxels (v1) or the "
+                         "actual gaussians' visible support (audit §12 fix)")
+    ap.add_argument("--av-gauss-probe", type=int, default=50000,
+                    help="number of probe gaussians for --av-cover-target gauss")
+    ap.add_argument("--av-cover-gate", action="store_true",
+                    help="apply the kernel's r_px / depth window inside the "
+                         "gaussian-support objective")
+    ap.add_argument("--av-gauss-rstar", type=float, default=0.0,
+                    help="T1-B: ideal projected pixel radius r* (>0 enables the "
+                         "smooth quality objective instead of binary visibility)")
+    ap.add_argument("--av-gauss-rsigma", type=float, default=1.0,
+                    help="T1-B: log-radius tolerance sigma_r")
+    ap.add_argument("--av-gauss-agg", choices=["max", "cap"], default="max",
+                    help="T1-B: facility-location (max) or saturating sum (cap)")
+    ap.add_argument("--av-gauss-cap", type=float, default=3.0,
+                    help="T1-B: saturation cap for --av-gauss-agg cap")
+    ap.add_argument("--av-phi", default="",
+                    help="T4-A: explicit coverage curve phi, e.g. '0,1' (strict "
+                         "1-coverage), '0,1,1.15,1.2' (soft)")
+    ap.add_argument("--av-shell-ratios", default="0.40,0.35,0.25",
+                    help="T1-A: inner/mid/outer shell slot fractions for "
+                         "--av-pos-mode multishell")
+    ap.add_argument("--av-ring-radii", default="1.0,2.0,3.5",
+                    help="T5-A: voxel-free ring radii (x R_core) for "
+                         "--av-pos-mode rings; small values give the T5-B "
+                         "compact indoor inner ring (e.g. 0.25,0.45,0.65)")
+    ap.add_argument("--av-diverse-quota", action="store_true",
+                    help="T4-B: enforce a near/mid/far distance-band quota on the "
+                         "8 selected cameras")
+    ap.add_argument("--av-pos-b", type=int, default=24,
+                    help="S2 dual_domain: number of Domain-B (full-AABB) positions")
+    ap.add_argument("--av-unified-frac", type=float, default=0.5,
+                    help="S3 unified: share of interior-pocket positions (rest from "
+                         "the exterior frontier)")
+    ap.add_argument("--av-normal-mode", choices=["kstep", "n2"], default="kstep",
+                    help="T2-A: normal orientation for the vote module: 'kstep' "
+                         "(N0, v1 local stepping) or 'n2' (structure tensor + "
+                         "global focus/cavity orientation)")
+    ap.add_argument("--av-cavity-frac", type=float, default=0.75,
+                    help="share of indoor candidates taken from the interior cavity")
+    ap.add_argument("--av-no-zbuf", action="store_true", help="disable soft z-buffer occlusion")
+    ap.add_argument("--av-no-scale-gate", action="store_true",
+                    help="disable the +0.3I projection-scale gate")
+    ap.add_argument("--av-normal-gate", action="store_true", help="enable grazing-angle gate")
+    ap.add_argument("--av-dump-json", default="",
+                    help="write the rig + stats to this json path (Phase 1 diagnostics)")
     args = ap.parse_args()
 
-    if args.opacity_mode != "O0" and not args.o2_scene:
-        raise SystemExit("--opacity-mode O2/O2cal requires --o2-scene")
+    if args.opacity_mode != "O0" and not args.o2_scene and \
+            args.o2_cams not in ("virtual", "auto_virt", "json"):
+        raise SystemExit("--opacity-mode O2/O2cal requires --o2-scene "
+                         "(except for --o2-cams virtual / auto_virt)")
     if args.o2_cams == "pair" and args.opacity_mode != "O0":
         if args.o2_device != "gpu" or args.merge_device != "gpu":
             raise SystemExit("--o2-cams pair requires --o2-device gpu --merge-device gpu")
@@ -411,7 +601,7 @@ def main():
             _o2_cams = args.o2_cams
             if _o2_cams == "auto":
                 # SfM data is the normal case; a bare PLY must not fail here.
-                _sp0 = os.path.join(args.o2_scene, "sparse", "0", "images.bin")
+                _sp0 = os.path.join(args.o2_scene or "", "sparse", "0", "images.bin")
                 _o2_cams = "fast" if os.path.exists(_sp0) else "virtual"
                 print(f"o2-cams auto -> {_o2_cams} "
                       f"({'found ' + _sp0 if _o2_cams == 'fast' else 'no sparse/0, using a synthetic rig'})",
@@ -438,34 +628,77 @@ def main():
                 # so it is derived from the full list instead of re-read.
                 from cams_fast import load_cams_fast
                 from pics import CamPool
-                _all = load_cams_fast(args.o2_scene, "fit", 0)
-                _n = len(_all)
-                _k = int(args.o2_views)
-                if 0 < _k < _n:
-                    _step = _n / _k
-                    o2fast_ids = [int(i * _step) for i in range(_k)]
+                if getattr(args, "o2_pool", "real") == "virt":
+                    # camera-free PICS: the candidate pool is the dense virtual
+                    # rig, every merge pair then picks its own B views from it
+                    from o2_auto_virt import extract_auto_virtual_cams
+                    _all, _pst = extract_auto_virtual_cams(
+                        t_mu, t_sc, t_q, t_op,
+                        n_views=int(args.o2_views), grid_res=args.av_res,
+                        n_pos=args.av_npos, n_dirs=args.av_ndirs,
+                        fov_deg=args.av_fov, W=args.o2_res_w, H=args.o2_res_h,
+                        cov_k=args.av_cov_k, use_zbuf=not args.av_no_zbuf,
+                        use_scale_gate=not args.av_no_scale_gate,
+                        d_safe=args.av_dsafe, d_far=args.av_dfar,
+                        r_target=args.av_rtarget, cavity_frac=args.av_cavity_frac,
+                        d_lo_frac=args.av_dlo, d_hi_frac=args.av_dhi,
+                        cavity_min6=args.av_cav6, noblas=bool(args.no_blas),
+                        core_aabb=args.av_core_aabb, dmode=args.av_dmode,
+                        r_ref=args.av_rref, soft_scale=args.av_soft_scale,
+                        dir_mode=args.av_dir_mode, pitches=args.av_pitches,
+                        grav_lower=args.av_grav_lower, cos_weight=args.av_cos_weight,
+                        cmax=args.av_cmax, pos_mode=args.av_pos_mode,
+                        eta0=args.av_eta0, n_corr=args.av_ncorr,
+                        dir_bins=args.av_dir_bins,
+                        aniso_weight=args.av_aniso_weight,
+                        pca_corridor_only=bool(args.av_pca_corridor_only),
+                        weight_mode=args.av_weight_mode, gate_rel=args.av_gate_rel,
+                        seed=args.seed, return_stats=True, return_pool=True)
+                    _n = len(_all)
+                    o2fast_ids = list(_pst["chosen"])
+                    o2pool = CamPool(_all, dev)
+                    cams = [_all[i] for i in o2fast_ids]
+                    sp = None
+                    print(f"o2-cams pair(virt): pool {_n} virtual cameras "
+                          f"(mode={_pst['mode']}), fast-B {o2fast_ids}", flush=True)
                 else:
-                    o2fast_ids = list(range(_n))
-                o2pool = CamPool(_all, dev)
-                cams = [_all[i] for i in o2fast_ids]
-                sp = None
+                    _all = load_cams_fast(args.o2_scene, "fit", 0)
+                    _n = len(_all)
+                    _k = int(args.o2_views)
+                    if 0 < _k < _n:
+                        _step = _n / _k
+                        o2fast_ids = [int(i * _step) for i in range(_k)]
+                    else:
+                        o2fast_ids = list(range(_n))
+                    o2pool = CamPool(_all, dev)
+                    cams = [_all[i] for i in o2fast_ids]
+                    sp = None
                 if args.o2_pick == "pref":
                     # base set = the historical greedy coverage selection; every
                     # merge pair keeps it where it has support and repairs the
                     # rest (plan 16.2 step 5).
-                    from cams_fast import pick_cover_views
-                    o2pref_ids = pick_cover_views(_all, t_mu.detach().cpu().numpy(),
-                                                 k=args.o2_views)
+                    if getattr(args, "o2_pool", "real") == "virt":
+                        o2pref_ids = list(o2fast_ids)
+                    else:
+                        from cams_fast import pick_cover_views
+                        o2pref_ids = pick_cover_views(_all, t_mu.detach().cpu().numpy(),
+                                                      k=args.o2_views)
                     print(f"o2-pick pref: base cover set {o2pref_ids}", flush=True)
                 if args.o2_pick == "track":
-                    # photogrammetric redundancy proxy (plan 11.6): COLMAP track
-                    # overlap between fit cameras, parsed once and cached.
-                    import cams_track
-                    _M, _ = cams_track.load_overlap(args.o2_scene, o2pool)
-                    o2pool.M = torch.as_tensor(_M, device=dev)
-                    del _M
-                    print(f"o2-pick track: overlap matrix {tuple(o2pool.M.shape)}, "
-                          f"lam {args.o2_track_lam}", flush=True)
+                    if getattr(args, "o2_pool", "real") != "virt":
+                        # photogrammetric redundancy proxy (plan 11.6): COLMAP track
+                        # overlap between fit cameras, parsed once and cached.
+                        import cams_track
+                        _M, _ = cams_track.load_overlap(args.o2_scene, o2pool)
+                        o2pool.M = torch.as_tensor(_M, device=dev)
+                        del _M
+                        print(f"o2-pick track: overlap matrix {tuple(o2pool.M.shape)}, "
+                              f"lam {args.o2_track_lam}", flush=True)
+                    else:
+                        print("o2-pick track: not available for a virtual pool "
+                              "(no COLMAP tracks); falling back to 'repair'",
+                              flush=True)
+                        args.o2_pick = "repair"
                 if args.o2_sh_ref == "fast":
                     # decoupled DC SH correction: accumulate over the fixed fast-B
                     # views, never over the per-pair selection
@@ -485,10 +718,124 @@ def main():
                 sp = None
                 print(f"virtual rig '{args.o2_rig}': {len(cams)} views, "
                       f"fov={args.o2_fov} {args.o2_res_w}x{args.o2_res_h}", flush=True)
+            elif _o2_cams == "auto_virt":
+                # camera-free rig (camera_free_o2cal.md): no COLMAP pose, no images
+                import json as _json
+                from o2_auto_virt import extract_auto_virtual_cams
+                _extra = None
+                if args.av_pos_mode == "dual_domain":
+                    # S2: Domain B = the *full*-AABB rig (no core shrink); Domain A
+                    # is the regular core_aabb run.  Both pools go into one greedy.
+                    _kwB = dict(
+                        n_views=args.o2_views, grid_res=args.av_res,
+                        n_pos=args.av_pos_b, n_dirs=args.av_ndirs,
+                        fov_deg=args.av_fov, W=args.o2_res_w, H=args.o2_res_h,
+                        cov_k=args.av_cov_k, use_zbuf=not args.av_no_zbuf,
+                        use_scale_gate=False, d_safe=args.av_dsafe,
+                        d_far=args.av_dfar, r_target=args.av_rtarget,
+                        cavity_frac=args.av_cavity_frac, d_lo_frac=0.20,
+                        d_hi_frac=args.av_dhi, cavity_min6=args.av_cav6,
+                        noblas=bool(args.no_blas), core_aabb=1.0,
+                        dmode=args.av_dmode, r_ref=args.av_rref,
+                        soft_scale=args.av_soft_scale,
+                        dir_mode="gravity", pitches="0",
+                        cos_weight=0.0, cmax=args.av_cmax,
+                        pos_mode="frontier", dir_bins=0, aniso_weight=0.0,
+                        seed=args.seed, return_stats=False, return_pool=True)
+                    _extra = extract_auto_virtual_cams(t_mu, t_sc, t_q, t_op, **_kwB)
+                    print(f"o2-cams dual_domain: Domain B pool = {len(_extra)} cams",
+                          flush=True)
+                cams, _avs = extract_auto_virtual_cams(
+                    t_mu, t_sc, t_q, t_op,
+                    n_views=args.o2_views, grid_res=args.av_res,
+                    n_pos=args.av_npos, n_dirs=args.av_ndirs,
+                    fov_deg=args.av_fov, W=args.o2_res_w, H=args.o2_res_h,
+                    cov_k=args.av_cov_k,
+                    use_zbuf=not args.av_no_zbuf,
+                    use_scale_gate=not args.av_no_scale_gate,
+                    use_normal_gate=args.av_normal_gate,
+                    d_safe=args.av_dsafe, d_far=args.av_dfar,
+                    r_target=args.av_rtarget, cavity_frac=args.av_cavity_frac,
+                    d_lo_frac=args.av_dlo, d_hi_frac=args.av_dhi,
+                    cavity_min6=args.av_cav6, noblas=bool(args.no_blas),
+                    core_aabb=args.av_core_aabb, dmode=args.av_dmode,
+                    r_ref=args.av_rref, soft_scale=args.av_soft_scale,
+                    dir_mode=args.av_dir_mode, pitches=args.av_pitches,
+                    grav_lower=args.av_grav_lower,
+                    cos_weight=args.av_cos_weight, cmax=args.av_cmax,
+                    pos_mode=args.av_pos_mode, eta0=args.av_eta0,
+                    n_corr=args.av_ncorr, dir_bins=args.av_dir_bins,
+                    aniso_weight=args.av_aniso_weight,
+                    pca_corridor_only=bool(args.av_pca_corridor_only),
+                    weight_mode=args.av_weight_mode,
+                    gate_rel=args.av_gate_rel,
+                    cover_target=args.av_cover_target,
+                    n_gauss_probe=args.av_gauss_probe,
+                    cover_gate=bool(args.av_cover_gate),
+                    extra_cams=_extra,
+                    unified_frac=float(args.av_unified_frac),
+                    gauss_rstar=args.av_gauss_rstar,
+                    gauss_rsigma=args.av_gauss_rsigma,
+                    gauss_agg=args.av_gauss_agg,
+                    gauss_cap=args.av_gauss_cap,
+                    phi_override=args.av_phi,
+                    normal_mode=args.av_normal_mode,
+                    shell_ratios=args.av_shell_ratios,
+                    ring_radii=args.av_ring_radii,
+                    diverse_quota=bool(args.av_diverse_quota),
+                    seed=args.seed, return_stats=True)
+                sp = None
+                print(f"o2-cams auto_virt: {len(cams)} views mode={_avs['mode']} "
+                      f"cav={_avs['n_cavity']} surf={_avs['n_surface']} "
+                      f"d_target={_avs['d_target']:.4f} "
+                      f"Lmax={_avs['Lmax']:.3f} "
+                      f"t={_avs['t_total_ms']:.1f}ms "
+                      f"[s1={_avs['t_step1_ms']:.1f} s2={_avs['t_step2_ms']:.1f} "
+                      f"s3={_avs['t_step3_ms']:.1f} s4={_avs['t_step4_ms']:.1f}]",
+                      flush=True)
+                if args.av_dump_json:
+                    with open(args.av_dump_json, "w") as _fh:
+                        _json.dump({"stats": _avs,
+                                    "cams": [{"name": c["name"],
+                                              "w2v": np.asarray(c["w2v"]).tolist(),
+                                              "C": np.asarray(c["C"]).tolist(),
+                                              "fx": c["fx"], "fy": c["fy"],
+                                              "W": c["W"], "H": c["H"]}
+                                             for c in cams]}, _fh, indent=1)
+                    print(f"o2-cams auto_virt: rig dumped -> {args.av_dump_json}",
+                          flush=True)
+            elif _o2_cams == "json":
+                # closed-loop verification: replay an explicit camera list
+                if not args.o2_cams_json:
+                    raise SystemExit("--o2-cams json requires --o2-cams-json")
+                import json as _json
+                with open(args.o2_cams_json) as _fh:
+                    raw = _json.load(_fh)
+                if isinstance(raw, dict):
+                    raw = raw.get("cams", [])
+                cams = [dict(name=r["name"],
+                             w2v=np.asarray(r["w2v"], np.float64),
+                             fx=float(r["fx"]), fy=float(r["fy"]),
+                             W=float(r["W"]), H=float(r["H"]),
+                             C=np.asarray(r["C"], np.float64)) for r in raw]
+                sp = None
+                print(f"o2-cams json: loaded {len(cams)} cameras from "
+                      f"{args.o2_cams_json}", flush=True)
             else:
                 from ops2 import split_names, load_cams
                 sp = split_names(args.o2_scene)
                 cams = load_cams(sp, "fit", args.o2_views)
+            if args.o2_dump_cams:
+                import json as _json
+                with open(args.o2_dump_cams, "w") as _fh:
+                    _json.dump([{"name": c["name"],
+                                 "w2v": np.asarray(c["w2v"]).tolist(),
+                                 "C": np.asarray(c["C"]).tolist(),
+                                 "fx": float(c["fx"]), "fy": float(c["fy"]),
+                                 "W": float(c["W"]), "H": float(c["H"])}
+                                for c in cams], _fh, indent=1)
+                print(f"o2-cams {_o2_cams}: dumped {len(cams)} cameras -> "
+                      f"{args.o2_dump_cams}", flush=True)
             o2cams = O2Cameras(cams, dev)
         o2stats.update({"scene": args.o2_scene, "views": o2cams.V,
                         "names": o2cams.names, "grid": args.o2_grid,
@@ -884,7 +1231,7 @@ def main():
                                     _scr = o2pool.screen(
                                         comp["mu_m"], comp["sc_m"],
                                         sigma_cut=args.o2_sigma_cut,
-                                        want_area=(args.o2_pick == "info"))
+                                        want_area=(args.o2_pick in ("info", "scale_opt")))
                                     if args.o2_pick == "fixed":
                                         _ids = [int(v) for v in
                                                 args.o2_fixed_ids.split(",") if v != ""]
@@ -898,12 +1245,31 @@ def main():
                                             fast_ids=o2fast_ids,
                                             nbins=(args.o2_nbins or None),
                                             pref_ids=o2pref_ids,
-                                            track_lam=args.o2_track_lam)
+                                            track_lam=args.o2_track_lam,
+                                            rstar=args.o2_rstar)
                                     del _scr
                                     _nsel = (_sel >= 0).sum(1).float()
                                     pst["o2_sel_views"] = float(_nsel.mean())
                                     pst["o2_sel_zero"] = float((_nsel == 0).float().mean())
                                     del _nsel
+                                    if o2fast_ids is not None and _sel.shape[0] > 0:
+                                        # R3: how often does the selector actually
+                                        # deviate from the historical fast-B set?
+                                        _fi = torch.as_tensor(
+                                            o2fast_ids, device=dev,
+                                            dtype=torch.int32)
+                                        _k = min(_sel.shape[1], _fi.numel())
+                                        _a = _sel[:, :_k]                    # (P,k)
+                                        # order-insensitive: how often is each
+                                        # fast camera kept in the selected set?
+                                        _keep = [_a.eq(_fi[j]).any(1).float().mean()
+                                                 for j in range(_k)]
+                                        _kept = float(sum(float(x) for x in _keep)) / _k
+                                        pst["o2_reroute"] = 1.0 - _kept
+                                        print(f"  [o2-pick {args.o2_pick}] fast-B kept "
+                                              f"{100*_kept:.1f}% of slots "
+                                              f"(re-routed {100*pst['o2_reroute']:.1f}%)",
+                                              flush=True)
                                     prof.tot["o2_pick"] = (prof.tot.get("o2_pick", 0.0)
                                                            + time.perf_counter() - _t0)
                                     new_op = _pics.opacity_o2cal_gpu_pool(
@@ -919,6 +1285,31 @@ def main():
                                     del _sel
                                 else:
                                     from o2gpu import opacity_o2cal_gpu as _o2
+                                    _o2_dump = {} if args.o2_debug_dump else None
+                                    _dc_buf = None
+                                    if args.o2_fit_dc:
+                                        _dc_buf = torch.zeros(int(p_t.shape[0]), 3,
+                                                              dtype=torch.float64,
+                                                              device=dev)
+                                    _eg_mode = str(args.o2_eigen_mode)
+                                    _eg_eps = (0.0 if _eg_mode in ("E0", "E1")
+                                               else 0.3) if args.o2_eigen_eps < 0 else \
+                                              float(args.o2_eigen_eps)
+                                    _eg_gamma = float(args.o2_eigen_gamma)
+                                    if _eg_mode in ("E1",):
+                                        _eg_gamma, _eg_eps = 1.0, 0.0
+                                    if _eg_gamma <= 0.0:
+                                        # core AABB extent from the point cloud only
+                                        # (no voxel grid, no camera): 5-95% box
+                                        _q05 = torch.quantile(t_mu, 0.05, dim=0)
+                                        _q95 = torch.quantile(t_mu, 0.95, dim=0)
+                                        _Lcore = float((_q95 - _q05).norm())
+                                        _dcore = 0.20 * _Lcore
+                                        _deff = max(float(args.o2_eigen_cdist) * _dcore, 1e-6)
+                                        _eg_gamma = float(args.o2_eigen_fpx) / _deff
+                                        print(f"  [o2-eigen] L_core={_Lcore:.3f} "
+                                              f"d_core={_dcore:.3f} d_eff={_deff:.3f} "
+                                              f"gamma={_eg_gamma:.3f} px/unit", flush=True)
                                     new_op = _o2({"mu": t_mu, "sc": t_sc, "q": t_q,
                                                   "op": t_op},
                                                  comp, p_t, o2cams, grid=args.o2_grid,
@@ -927,7 +1318,33 @@ def main():
                                                  batch=args.o2_batch,
                                                  stats=o2stats, timers=prof.tot,
                                                  noblas=bool(args.no_blas),
-                                                 cache=sh_cache, sh_sums=sh_sums)
+                                                 cache=sh_cache, sh_sums=sh_sums,
+                                                 view_tau=float(args.o2_view_tau),
+                                                 view_rmax=float(args.o2_view_rmax),
+                                                 solver=str(args.o2_solver),
+                                                 cf_beta=float(args.o2_cf_beta),
+                                                 cf_agg=str(args.o2_cf_agg),
+                                                 cf_fix=bool(args.o2_cf_fix),
+                                                 cf_safe=bool(args.o2_cf_safe),
+                                                 cf_c0=float(args.o2_cf_c0),
+                                                 clean_mask=bool(args.o2_clean_mask),
+                                                 bound_guard=bool(args.o2_cf_bound),
+                                                 sh_dc=(t_sh[:, :3] if args.o2_fit_dc
+                                                        and t_sh is not None
+                                                        and t_sh.shape[1] >= 3 else None),
+                                                 dc_out=_dc_buf,
+                                                 eg_mode=str(args.o2_eigen_mode),
+                                                 eg_gamma=_eg_gamma,
+                                                 eg_eps=_eg_eps,
+                                                 eg_wmode=str(args.o2_eigen_wmode),
+                                                 eg_psi=float(args.o2_eigen_psi),
+                                                 debug_dump=_o2_dump)
+                                    if _o2_dump:
+                                        torch.save(_o2_dump, args.o2_debug_dump)
+                                        print(f"  [o2-debug] dumped "
+                                              f"{list(_o2_dump.keys())} -> "
+                                              f"{args.o2_debug_dump}", flush=True)
+                                        _o2_dump = None
                             else:
                                 from o2gpu import opacity_o2cal_cpu as _o2
                                 new_op = _o2({"mu": mu, "sc": sc, "q": q, "op": op},
@@ -938,6 +1355,17 @@ def main():
                                              calibrate=calibrate, stats=o2stats,
                                              timers=prof.tot)
                         comp["op_m"] = new_op.to(device=dev, dtype=torch.float32)
+                        if args.o2_fit_dc and _dc_buf is not None and \
+                                comp.get("sh_m") is not None:
+                            # `_dc_buf` is a transmittance-weighted average of the
+                            # RAW f_dc coefficients.  rgb = SH_C0*dc + 0.5 is affine,
+                            # so averaging the raw coefficients is exactly the
+                            # weighted average of the colours: write them straight in.
+                            _has = _dc_buf.abs().sum(1) > 0
+                            _shm = comp["sh_m"]
+                            if int(_has.sum()):
+                                _shm[_has, :3] = _dc_buf[_has].to(torch.float32)
+                            pst["o2_dc_fit_frac"] = float(_has.float().mean())
                         pst["o2_mean_alpha"] = float(new_op.mean())
                         if args.o2_verbose_pass and (it + 1) == args.o2_verbose_pass:
                             from o2gpu import opacity_o2cal_cpu as _ocpu

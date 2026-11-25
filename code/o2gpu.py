@@ -1,4 +1,4 @@
-﻿"""GPU O2cal: batched projected-coverage opacity fit + per-pass calibration.
+"""GPU O2cal: batched projected-coverage opacity fit + per-pass calibration.
 
 Semantics are those of `ops2.fit_alpha_coverage` / `replay_merge.opacity_o2`
 (the CPU reference used by the project), re-expressed so that the batch axes are
@@ -63,7 +63,8 @@ def _rot(q):
     return R
 
 
-def _project(mu, sc, q, cams: O2Cameras, dtype=torch.float64, noblas=False):
+def _project(mu, sc, q, cams: O2Cameras, dtype=torch.float64, noblas=False,
+             return_tz=False):
     """EWA projection of (B,3)/(B,3)/(B,4) gaussians into all views at once.
 
     Runs in float64 by default: the 2-D covariance of a strongly anisotropic
@@ -119,6 +120,8 @@ def _project(mu, sc, q, cams: O2Cameras, dtype=torch.float64, noblas=False):
         S2 = torch.matmul(Mv, M_.transpose(-1, -2))                  # (B,V,2,2)
     eye = torch.eye(2, dtype=dtype, device=mu.device)
     S2 = 0.5 * (S2 + S2.transpose(-1, -2)) + 0.3 * eye
+    if return_tz:
+        return mu2d, S2, valid, pc[..., 2]
     return mu2d, S2, valid
 
 
@@ -160,7 +163,14 @@ def _det2(S2):
 
 def opacity_o2cal_gpu(state, comp, pairs, cams, grid=9, sigma_cut=2.0,
                       calibrate=False, batch=16384, stats=None, timers=None,
-                      dtype=torch.float64, noblas=False, cache=None, sh_sums=None):
+                      dtype=torch.float64, noblas=False, cache=None, sh_sums=None,
+                      view_tau=0.0, view_rmax=40.0,
+                      solver="grid", cf_beta=0.0, cf_agg="eq",
+                      cf_fix=False, cf_safe=False, cf_c0=0.15,
+                      clean_mask=False, bound_guard=False,
+                      sh_dc=None, dc_out=None,
+                      eg_mode="E1", eg_gamma=1.0, eg_eps=0.0, eg_wmode="area",
+                      eg_psi=35.0, debug_dump=None):
     """state: dict(mu,sc,q,op) of the PRE-merge model (GPU tensors).
     comp: dict(mu_m,sc_m,q_m,op_m) merge results for `pairs`.
     Returns the fitted opacity for the merged splats (P,), float32, on device.
@@ -196,21 +206,66 @@ def opacity_o2cal_gpu(state, comp, pairs, cams, grid=9, sigma_cut=2.0,
     for b0 in range(0, P, batch):
         b1 = min(P, b0 + batch)
         sl = slice(b0, b1)
+        if solver == "eigen":
+            # Per-pair eigen-axis closed form (pair_o2cal.md).  NOTE: this branch
+            # touches NEITHER `cams` NOR the grid, so it is provably independent
+            # of the camera rig: the same weights must reproduce under any
+            # --o2-cams value.
+            from o2_eigen import o2_eigen_batch as _o2eig
+            t = _tic()
+            a_star, _hs, _ws = _o2eig(
+                mu[i[sl]].to(dtype), mu[j[sl]].to(dtype), comp["mu_m"][sl].to(dtype),
+                sc[i[sl]].to(dtype), sc[j[sl]].to(dtype), comp["sc_m"][sl].to(dtype),
+                q[i[sl]].to(dtype), q[j[sl]].to(dtype), comp["q_m"][sl].to(dtype),
+                a_i_all[b0:b1], a_j_all[b0:b1],
+                mode=str(eg_mode), gamma=float(eg_gamma), eps_ewa=float(eg_eps),
+                beta=float(cf_beta), w_mode=str(eg_wmode), psi_deg=float(eg_psi))
+            num[b0:b1] = a_star
+            den[b0:b1] = 1.0
+            cnt[b0:b1] = 1
+            o2_views += (b1 - b0)
+            _toc(timers, "o2_eigen", t)
+            continue
         t = _tic()
-        mu2d_i, S2_i, v_i = _project(mu[i[sl]], sc[i[sl]], q[i[sl]], cams, dtype, noblas)
-        mu2d_j, S2_j, v_j = _project(mu[j[sl]], sc[j[sl]], q[j[sl]], cams, dtype, noblas)
-        mu2d_m, S2_m, v_m = _project(comp["mu_m"][sl], comp["sc_m"][sl],
-                                     comp["q_m"][sl], cams, dtype, noblas)
-        _toc(timers, "o2_project", t)
+        t = _tic()
+        tz_i = tz_j = tz_m = None
+        if clean_mask:
+            # M2/M3: a sigma_cut-free validity test.  Only geometry that any
+            # renderer must agree on: a safe near plane, the merged centre inside
+            # the image, and no degenerate tangential blow-up.
+            mu2d_i, S2_i, v_i, tz_i = _project(mu[i[sl]], sc[i[sl]], q[i[sl]],
+                                               cams, dtype, noblas, True)
+            mu2d_j, S2_j, v_j, tz_j = _project(mu[j[sl]], sc[j[sl]], q[j[sl]],
+                                               cams, dtype, noblas, True)
+            mu2d_m, S2_m, v_m, tz_m = _project(comp["mu_m"][sl], comp["sc_m"][sl],
+                                               comp["q_m"][sl], cams, dtype,
+                                               noblas, True)
+            _toc(timers, "o2_project", t)
+            t = _tic()
+            cx, cy = mu2d_m[..., 0], mu2d_m[..., 1]
+            ok = (tz_i > 0.2) & (tz_j > 0.2) & (tz_m > 0.2)
+            ok &= (cx >= 0.0) & (cx < Wd) & (cy >= 0.0) & (cy < Hd)
+            for S_ in (S2_i, S2_j, S2_m):
+                s00_, s01_, s11_ = S_[..., 0, 0], S_[..., 0, 1], S_[..., 1, 1]
+                ok &= torch.isfinite(s00_) & torch.isfinite(s11_)
+                ok &= (s00_ < 1e8) & (s11_ < 1e8)
+            rr = sigma_cut * torch.sqrt(torch.clamp(_lmax2x2(S2_m), min=1e-9))
+            _toc(timers, "o2_mask", t)
+        else:
+            mu2d_i, S2_i, v_i = _project(mu[i[sl]], sc[i[sl]], q[i[sl]], cams, dtype, noblas)
+            mu2d_j, S2_j, v_j = _project(mu[j[sl]], sc[j[sl]], q[j[sl]], cams, dtype, noblas)
+            mu2d_m, S2_m, v_m = _project(comp["mu_m"][sl], comp["sc_m"][sl],
+                                         comp["q_m"][sl], cams, dtype, noblas)
+            _toc(timers, "o2_project", t)
 
-        t = _tic()
-        rr = sigma_cut * torch.sqrt(torch.clamp(_lmax2x2(S2_m), min=1e-9))
-        cx, cy = mu2d_m[..., 0], mu2d_m[..., 1]
-        ok = v_i & v_j & v_m & (rr > 1e-3)
-        ok &= torch.isfinite(cx) & torch.isfinite(cy) & torch.isfinite(rr)
-        ok &= (cx > -rr) & (cx < Wd + rr)
-        ok &= (cy > -rr) & (cy < Hd + rr)
-        _toc(timers, "o2_mask", t)
+            t = _tic()
+            rr = sigma_cut * torch.sqrt(torch.clamp(_lmax2x2(S2_m), min=1e-9))
+            cx, cy = mu2d_m[..., 0], mu2d_m[..., 1]
+            ok = v_i & v_j & v_m & (rr > 1e-3)
+            ok &= torch.isfinite(cx) & torch.isfinite(cy) & torch.isfinite(rr)
+            ok &= (cx > -rr) & (cx < Wd + rr)
+            ok &= (cy > -rr) & (cy < Hd + rr)
+            _toc(timers, "o2_mask", t)
 
         if cache is not None or sh_sums is not None:
             det_i = _det2(S2_i)
@@ -234,10 +289,95 @@ def opacity_o2cal_gpu(state, comp, pairs, cams, grid=9, sigma_cut=2.0,
         bv = torch.nonzero(ok.reshape(-1), as_tuple=False).flatten()   # (K,) local
         if bv.numel() == 0:
             continue
+
+        t = _tic()
         b_idx = (bv // cams.V) + b0
         v_idx = bv % cams.V
 
-        t = _tic()
+        if solver == "analytic":
+            # Analytical closed form (o2cal_analytical_closed_form.md): the exact
+            # continuous L2 solution, no 9x9 grid, elementwise float64 only.
+            #
+            # gather: the closed form is evaluated ONLY on the valid (pair, view)
+            # entries (K of them), then scattered back per pair.  The grid path
+            # already works this way; without it the solver walked the full
+            # (B, V) tensor and was 6-7x the grid cost on small scenes.
+            from o2_analytic import o2_closed_form_batch as _o2cf
+            bn = b1 - b0
+            b_loc = bv // cams.V
+            flat = lambda x: x.reshape(-1, *x.shape[2:])[bv]
+            ones_k = torch.ones(bv.numel(), 1, dtype=torch.bool, device=dev)
+            ai_k = a_i_all[b0:b1][b_loc]
+            aj_k = a_j_all[b0:b1][b_loc]
+            _, _, _trm = _o2cf(
+                flat(mu2d_i), flat(mu2d_j), flat(mu2d_m),
+                flat(S2_i), flat(S2_j), flat(S2_m), ai_k, aj_k, ones_k,
+                beta=float(cf_beta), agg="eq",
+                clamp_c=bool(cf_fix), safe_mask=bool(cf_safe),
+                c0_floor=float(cf_c0), bound_guard=bool(bound_guard))
+            av = _trm["alpha_v"][:, 0]            # per-valid-entry alpha, (K,)
+            m_el = _trm["w_v"][:, 0]              # 0 where the entry is degenerate
+            if str(cf_agg) == "eq":
+                w_el = m_el
+            else:
+                Sg = flat(S2_m)
+                s00_, s01_, s11_ = Sg[..., 0, 0], Sg[..., 0, 1], Sg[..., 1, 1]
+                det_ = (s00_ * s11_ - s01_ * s01_).clamp(min=0.0)
+                tr_ = s00_ + s11_
+                rad_ = torch.sqrt(((s00_ - s11_) ** 2 + 4 * s01_ * s01_).clamp(min=0.0))
+                lmax_ = (0.5 * (tr_ + rad_)).clamp(min=1e-18)
+                lmin_ = (0.5 * (tr_ - rad_)).clamp(min=1e-18)
+                if str(cf_agg) == "area":
+                    w_el = m_el * torch.sqrt(det_)
+                elif str(cf_agg) == "ecc":
+                    w_el = m_el * (torch.sqrt(det_.clamp(min=1e-18)) / lmax_)
+                else:                              # ecc_floor
+                    c0 = float(cf_c0)
+                    w_el = m_el * (c0 + (1.0 - c0)
+                                   * torch.sqrt((lmin_ / lmax_).clamp(0.0, 1.0)))
+            num_p = torch.zeros(bn, dtype=dtype, device=dev)
+            den_p = torch.zeros(bn, dtype=dtype, device=dev)
+            num_p.index_add_(0, b_loc, (av * w_el).to(dtype))
+            den_p.index_add_(0, b_loc, w_el.to(dtype))
+            a_star = torch.where(den_p > 0, num_p / den_p.clamp(min=1e-12),
+                                 a0[b0:b1])
+            num[b0:b1] = a_star
+            den[b0:b1] = (den_p > 0).to(num.dtype)
+            cnt[b0:b1] = ok.sum(1).to(torch.int32)
+            o2_views += int(bv.numel())
+            if sh_dc is not None and dc_out is not None:
+                # DC (RGB) closed-form refit on exactly the same (pair, view) set
+                from o2_analytic import dc_color_fit as _dcf
+                ci_k = sh_dc[i[sl]].to(dtype)[b_loc]
+                cj_k = sh_dc[j[sl]].to(dtype)[b_loc]
+                col, cw = _dcf(flat(mu2d_i) - flat(mu2d_m),
+                               flat(mu2d_j) - flat(mu2d_m),
+                               flat(S2_i), flat(S2_j),
+                               flat(S2_m), ai_k, aj_k, ci_k, cj_k,
+                               torch.ones(bv.numel(), dtype=torch.bool, device=dev))
+                num_c = torch.zeros(bn, 3, dtype=dtype, device=dev)
+                den_c = torch.zeros(bn, dtype=dtype, device=dev)
+                wc = (cw * w_el).to(dtype)
+                num_c.index_add_(0, b_loc, col * wc[:, None])
+                den_c.index_add_(0, b_loc, wc)
+                dc_out[b0:b1] = torch.where(
+                    den_c[:, None] > 0, num_c / den_c.clamp(min=1e-12)[:, None],
+                    torch.zeros_like(num_c))
+            _toc(timers, "o2_cf", t)
+            if debug_dump is not None and "alpha_v" not in debug_dump:
+                av_full = torch.full((bn, cams.V), float("nan"), dtype=dtype, device=dev)
+                av_full.reshape(-1)[bv] = av
+                debug_dump["alpha_v"] = av_full.detach().cpu()
+                debug_dump["valid"] = ok.detach().cpu()
+                debug_dump["Sm"] = S2_m.detach().cpu()
+                debug_dump["Si"] = S2_i.detach().cpu()
+                debug_dump["Sj"] = S2_j.detach().cpu()
+                debug_dump["a_i"] = a_i_all[b0:b1].detach().cpu()
+                debug_dump["a_j"] = a_j_all[b0:b1].detach().cpu()
+                debug_dump["alpha_multi"] = a_star.detach().cpu()
+                debug_dump["solver"] = "analytic"
+            continue
+
         rrk = rr.reshape(-1)[bv]
         px = torch.minimum(torch.maximum(cx.reshape(-1)[bv, None] + gx[None, :] * rrk[:, None],
                                          torch.zeros((), dtype=dtype, device=dev)),
@@ -255,11 +395,46 @@ def opacity_o2cal_gpu(state, comp, pairs, cams, grid=9, sigma_cut=2.0,
         a_i = a_i_all[b_idx][:, None].to(Gi.dtype)
         a_j = a_j_all[b_idx][:, None].to(Gi.dtype)
         a_ref = 1.0 - (1.0 - a_i * Gi) * (1.0 - a_j * Gj)
-        num.index_add_(0, b_idx, (Gm * a_ref).sum(1).to(num.dtype))
-        den.index_add_(0, b_idx, (Gm * Gm).sum(1).to(den.dtype))
+        if view_tau > 0.0:
+            # S4: per-view projection-conditioning weight.  r^2/(r^2+tau^2) is a
+            # smooth 0..1 clarity score: sub-pixel views (already flattened by the
+            # +0.3 I low-pass) get down-weighted, sharp views dominate.  A hard
+            # cap at view_rmax only guards against degenerate close-ups.
+            r2 = rrk * rrk
+            wv = r2 / (r2 + float(view_tau) ** 2)
+            wv = torch.where(rrk <= float(view_rmax), wv, torch.zeros_like(wv))
+            num.index_add_(0, b_idx, (Gm * a_ref * wv[:, None]).sum(1).to(num.dtype))
+            den.index_add_(0, b_idx, (Gm * Gm * wv[:, None]).sum(1).to(den.dtype))
+        else:
+            num.index_add_(0, b_idx, (Gm * a_ref).sum(1).to(num.dtype))
+            den.index_add_(0, b_idx, (Gm * Gm).sum(1).to(den.dtype))
         cnt.index_add_(0, b_idx, torch.ones_like(b_idx, dtype=torch.int32))
         o2_views += int(b_idx.numel())
         _toc(timers, "o2_fit", t)
+        if debug_dump is not None and "num_v" not in debug_dump:
+            # per-(pair, view) intermediates of the GRID path, first batch only
+            bn = b1 - b0
+            num_v = torch.zeros(bn, cams.V, dtype=dtype, device=dev)
+            den_v = torch.zeros(bn, cams.V, dtype=dtype, device=dev)
+            loc = torch.nonzero(ok.reshape(-1), as_tuple=False).flatten()
+            bl = loc // cams.V
+            vl = loc % cams.V
+            num_v.index_put_((bl, vl), (Gm * a_ref).sum(1).to(dtype))
+            den_v.index_put_((bl, vl), (Gm * Gm).sum(1).to(dtype))
+            debug_dump["num_v"] = num_v.detach().cpu()
+            debug_dump["den_v"] = den_v.detach().cpu()
+            debug_dump["ui"] = mu2d_i.detach().cpu()
+            debug_dump["uj"] = mu2d_j.detach().cpu()
+            debug_dump["um"] = mu2d_m.detach().cpu()
+            debug_dump["valid"] = ok.detach().cpu()
+            debug_dump["Sm"] = S2_m.detach().cpu()
+            debug_dump["Si"] = S2_i.detach().cpu()
+            debug_dump["Sj"] = S2_j.detach().cpu()
+            debug_dump["a_i"] = a_i_all[b0:b1].detach().cpu()
+            debug_dump["a_j"] = a_j_all[b0:b1].detach().cpu()
+            debug_dump["alpha_multi"] = (num[b0:b1]
+                                         / torch.clamp(den[b0:b1], min=1e-9)).detach().cpu()
+            debug_dump["solver"] = "grid"
 
     t = _tic()
     am = torch.where(cnt > 0, num / torch.clamp(den, min=1e-9), a0)

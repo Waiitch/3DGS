@@ -1,0 +1,17 @@
+scene,method,dir,gauss,ply_mb,psnr,ssim,lpips
+truck,Original (prune 10%),/mnt/home1/wyq/ghap-work/ft_truck/truck10_orig,205572,48.6,19.31352424621582,0.6655888557434082,0.3881577253341675
+truck,Original + fine-tune,/mnt/home1/wyq/ghap-work/ft_truck/truck10_orig_full,205572,48.6,19.31352424621582,0.6655888557434082,0.3881577253341675
+truck,NanoGS,/mnt/home1/wyq/ghap-work/ft_truck/truck10_nanogs_bc,205572,48.6,21.260601043701172,0.734541118144989,0.3177538514137268
+truck,NanoGS + fine-tune,/mnt/home1/wyq/ghap-work/ft_truck/truck10_nanogs_bc_full,205572,48.6,21.260601043701172,0.734541118144989,0.3177538514137268
+truck,GHAP,/mnt/home1/wyq/ghap-work/ft_truck/truck10_ghap,205352,48.6,15.387774467468262,0.511711597442627,0.4630277752876282
+truck,GHAP + fine-tune,/mnt/home1/wyq/ghap-work/ft_truck/truck10_ghap_full,205352,48.6,15.387774467468262,0.511711597442627,0.4630277752876282
+truck,O2cal (archived),/mnt/home1/wyq/ghap-work/ft_truck/truck10_o2cal,205352,48.6,15.606756210327148,0.5419868230819702,0.4311823844909668
+room,NanoGS,/mnt/home1/wyq/ghap-work/ft_room/room10_nanogs_bc,131226,31.0,27.040878295898438,0.8234289884567261,0.34446918964385986
+room,NanoGS + fine-tune,/mnt/home1/wyq/ghap-work/ft_room/room10_nanogs_bc_full,131226,31.0,27.040878295898438,0.8234289884567261,0.34446918964385986
+room,GHAP,/mnt/home1/wyq/ghap-work/ft_room/room10_ghap,131164,31.0,19.650495529174805,0.6665863394737244,0.45352205634117126
+room,GHAP + fine-tune,/mnt/home1/wyq/ghap-work/ft_room/room10_ghap_full,131164,31.0,19.650495529174805,0.6665863394737244,0.45352205634117126
+truck,NanoGS (post-ft),/mnt/home1/wyq/ghap-work/ft_truck/truck10_nanogs_bc@45000,0,0,23.822118759155273,0.8091235160827637,0.2647656798362732
+room,NanoGS (post-ft),/mnt/home1/wyq/ghap-work/ft_room/room10_nanogs_bc@45000,0,0,29.68404769897461,0.8695467710494995,0.31302517652511597
+truck,GHAP (post-ft),/mnt/home1/wyq/ghap-work/ft_truck/truck10_ghap@45000,0,0,21.73415184020996,0.7453380227088928,0.3126908838748932
+room,GHAP (post-ft),/mnt/home1/wyq/ghap-work/ft_room/room10_ghap@45000,0,0,27.44264793395996,0.8278164863586426,0.35420089960098267
+truck,Original (post-ft),/mnt/home1/wyq/ghap-work/ft_truck/truck10_orig@45000,0,0,23.619550704956055,0.7965226769447327,0.28542184829711914
